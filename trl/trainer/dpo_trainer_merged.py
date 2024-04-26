@@ -966,8 +966,14 @@ class DPOTrainer(Trainer):
 
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
+        
+        chosen_loss_codes = concatenated_batch["concatenated_loss_codes"][:len_chosen]
+        rejected_loss_codes = concatenated_batch["concatenated_loss_codes"][len_chosen:]
+        
+        chosen_target_ids = concatenated_batch["concatenated_target_ids"][:len_chosen]
+        rejected_target_ids = concatenated_batch["concatenated_target_ids"][len_chosen:]
 
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits)
+        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_loss_codes, rejected_loss_codes, chosen_target_ids, rejected_target_ids)
 
     def get_batch_loss_metrics(
         self,
