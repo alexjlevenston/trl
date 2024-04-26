@@ -20,6 +20,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import wraps
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from enum import Enum
 
 import numpy as np
 import torch
@@ -63,6 +64,10 @@ if is_wandb_available():
 if is_deepspeed_available():
     import deepspeed
 
+class Losses(Enum):
+    NONE = 0
+    CROSS_ENTROPY = 1
+    DPO = 2
 
 class DPOTrainer(Trainer):
     r"""
