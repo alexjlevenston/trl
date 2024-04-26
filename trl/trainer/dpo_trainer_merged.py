@@ -742,23 +742,13 @@ class DPOTrainer(Trainer):
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
+                        _, _, _, _, _, _, _,
                     ) = self.concatenated_forward(self.model, padded_batch)
             else:
                 (
                     reference_chosen_logps,
                     reference_rejected_logps,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
+                    _, _, _, _, _, _, _,
                 ) = self.concatenated_forward(self.ref_model, padded_batch)
 
         return reference_chosen_logps, reference_rejected_logps
@@ -766,7 +756,6 @@ class DPOTrainer(Trainer):
     @staticmethod
     def concatenated_inputs(
         batch: Dict[str, Union[List, torch.LongTensor]],
-        is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
         padding_value: int = 0,
         device: Optional[torch.device] = None,
@@ -775,7 +764,6 @@ class DPOTrainer(Trainer):
 
         Args:
             batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
             label_pad_token_id: The label pad token id.
             padding_value: The padding value to use for the concatenated inputs_ids.
             device: The device for the concatenated inputs.
@@ -820,6 +808,12 @@ class DPOTrainer(Trainer):
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
         weights: torch.FloatTensor,
+        policy_chosen_logits: torch.FloatTensor,
+        policy_rejected_logits: torch.FloatTensor,
+        chosen_loss_codes: torch.LongTensor,
+        rejected_loss_codes: torch.LongTensor,
+        chosen_target_ids: torch.LongTensor,
+        rejected_target_ids: torch.LongTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -829,10 +823,16 @@ class DPOTrainer(Trainer):
             reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
             reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
             weights: Weight to assign to each chosen-rejected pair. Shape: (batch_size,)
+            policy_chosen_logits: Logits of the policy model for the chosen sequences. Shape: (batch_size, sequence_length, vocab_size)
+            policy_rejected_logits: Logits of the policy model for the rejected sequences. Shape: (batch_size, sequence_length, vocab_size)
+            chosen_loss_codes: Loss codes for chosen sequences. Shape: (batch_size, sequence_length)
+            rejected_loss_codes: Loss codes for rejected sequences. Shape: (batch_size, sequence_length)
+            chosen_target_ids: Target ids for chosen sequences. Shape: (batch_size, sequence_length)
+            rejected_target_ids: Target ids for rejected sequences. Shape: (batch_size, sequence_length)
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-            The losses tensor contains the DPO loss for each example in the batch.
+            The losses tensor contains the DPO loss and XEntropy loss for each example in the batch.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
         pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -905,9 +905,27 @@ class DPOTrainer(Trainer):
             ).detach()
         )
         
+        compute_xentropy = lambda loss_codes, target_ids, logits: (
+            torch.nn.functional.cross_entropy(
+                logits, 
+                target_ids, 
+                reduction='none'
+                ) * (loss_codes == Losses.CROSS_ENTROPY)).mean()
+        
+        xentropy_loss = (
+            compute_xentropy(
+                chosen_loss_codes, 
+                chosen_target_ids, 
+                policy_chosen_logits
+                ) + compute_xentropy(
+                    rejected_loss_codes, 
+                    rejected_target_ids, 
+                    policy_rejected_logits
+                    )
+                ) / 2
+        
         losses = losses * weights
-
-        return losses, chosen_rewards, rejected_rewards
+        return losses, chosen_rewards, rejected_rewards, xentropy_loss
 
     @staticmethod
     def get_batch_logps(
@@ -915,7 +933,6 @@ class DPOTrainer(Trainer):
         target_ids: torch.LongTensor,
         loss_codes: torch.LongTensor,
         average_log_prob: bool = False,
-        is_encoder_decoder: bool = False,
     ) -> torch.FloatTensor:
         """Compute the log probabilities of the given labels under the given logits.
 
@@ -924,7 +941,6 @@ class DPOTrainer(Trainer):
             target_ids: Token ids of the target sequences. Shape: (batch_size, sequence_length)
             loss_codes: Loss codes for tokens in sequences. Shape: (batch_size, sequence_length)
             average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
 
         Returns:
             A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
@@ -936,7 +952,7 @@ class DPOTrainer(Trainer):
 
         loss_mask = loss_codes == Losses.DPO
 
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=target_ids.unsqueeze(2)).squeeze(2)
 
         if average_log_prob:
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
@@ -952,7 +968,6 @@ class DPOTrainer(Trainer):
         """
         concatenated_batch = self.concatenated_inputs(
             batch,
-            is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
             padding_value=self.padding_value,
             device=self.accelerator.device,
@@ -970,7 +985,6 @@ class DPOTrainer(Trainer):
             concatenated_batch["concatenated_target_ids"],
             concatenated_batch["concatenated_loss_codes"],
             average_log_prob=self.loss_type == "ipo",
-            is_encoder_decoder=self.is_encoder_decoder,
         )
 
         chosen_logps = all_logps[:len_chosen]
@@ -1019,31 +1033,27 @@ class DPOTrainer(Trainer):
                         (
                             reference_chosen_logps,
                             reference_rejected_logps,
-                            _,
-                            _,
-                            _,
-                            _,
-                            _,
-                            _,
+                            _, _, _, _, _, _, _,
                         ) = self.concatenated_forward(self.model, batch)
                 else:
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
+                        _, _, _, _, _, _, _,
                     ) = self.concatenated_forward(self.ref_model, batch)
-
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+        
+        losses, chosen_rewards, rejected_rewards, xentropy_loss = self.dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
             weights,
+            policy_chosen_logits,
+            policy_rejected_logits,
+            chosen_loss_codes,
+            rejected_loss_codes,
+            chosen_target_ids,
+            rejected_target_ids,
         )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -1056,8 +1066,9 @@ class DPOTrainer(Trainer):
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+        metrics[f"{prefix}xentropy"] = xentropy_loss.detach().cpu()
 
-        return losses.mean(), metrics
+        return losses.mean(), xentropy_loss, metrics
 
     def compute_loss(
         self,
@@ -1074,62 +1085,17 @@ class DPOTrainer(Trainer):
         compute_loss_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
 
         with compute_loss_context_manager():
-            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
+            loss, xentropy_loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
         # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
         loss = loss.to(self.args.device)
+        xentropy_loss = xentropy_loss.to(self.args.device)
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
 
         if return_outputs:
-            return (loss, metrics)
-        return loss
-
-    def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
-        """Generate samples from the model and reference model for the given batch of inputs."""
-
-        # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
-        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
-        generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
-
-        with generate_context_manager():
-            policy_output = model.generate(
-                input_ids=batch["prompt_input_ids"],
-                attention_mask=batch["prompt_attention_mask"],
-                max_length=self.max_length,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-            # if reference_output in batch use that otherwise use the reference model
-            if "reference_output" in batch:
-                reference_output = batch["reference_output"]
-            else:
-                if self.ref_model is None:
-                    with self.null_ref_context():
-                        reference_output = self.model.generate(
-                            input_ids=batch["prompt_input_ids"],
-                            attention_mask=batch["prompt_attention_mask"],
-                            max_length=self.max_length,
-                            do_sample=True,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                        )
-                else:
-                    reference_output = self.ref_model.generate(
-                        input_ids=batch["prompt_input_ids"],
-                        attention_mask=batch["prompt_attention_mask"],
-                        max_length=self.max_length,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                    )
-
-        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
-        policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
-
-        reference_output = pad_to_length(reference_output, self.max_length, self.tokenizer.pad_token_id)
-        reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
-
-        return policy_output_decoded, reference_output_decoded
+            return (loss + xentropy_loss, metrics)
+        return loss + xentropy_loss
 
     def prediction_step(
         self,
@@ -1152,7 +1118,7 @@ class DPOTrainer(Trainer):
         prediction_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
 
         with torch.no_grad(), prediction_context_manager():
-            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
+            loss, xentropy_loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
 
         # force log the metrics
         self.store_metrics(metrics, train_eval="eval")
@@ -1189,34 +1155,6 @@ class DPOTrainer(Trainer):
 
         Works both with or without labels.
         """
-
-        # Sample and save to game log if requested (for one batch to save time)
-        if self.generate_during_eval:
-            # Generate random indices within the range of the total number of samples
-            num_samples = len(dataloader.dataset)
-            random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
-
-            # Use dataloader.dataset.select to get the random batch without iterating over the DataLoader
-            random_batch_dataset = dataloader.dataset.select(random_indices)
-            random_batch = self.data_collator(random_batch_dataset)
-            random_batch = self._prepare_inputs(random_batch)
-
-            policy_output_decoded, ref_output_decoded = self.get_batch_samples(self.model, random_batch)
-
-            self.log(
-                {
-                    "game_log": wandb.Table(
-                        columns=["Prompt", "Policy", "Ref Model"],
-                        rows=[
-                            [prompt, pol[len(prompt) :], ref[len(prompt) :]]
-                            for prompt, pol, ref in zip(
-                                random_batch["prompt"], policy_output_decoded, ref_output_decoded
-                            )
-                        ],
-                    )
-                }
-            )
-            self.state.log_history.pop()
 
         # Base evaluation
         initial_output = super().evaluation_loop(
