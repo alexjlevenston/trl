@@ -20,6 +20,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import wraps
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from enum import Enum
 
 import numpy as np
 import torch
@@ -63,6 +64,10 @@ if is_wandb_available():
 if is_deepspeed_available():
     import deepspeed
 
+class Losses(Enum):
+    NONE = 0
+    CROSS_ENTROPY = 1
+    DPO = 2
 
 class DPOTrainer(Trainer):
     r"""
@@ -663,54 +668,26 @@ class DPOTrainer(Trainer):
 
         return super().get_eval_dataloader(eval_dataset=eval_dataset)
 
-    def build_tokenized_answer(self, prompt, answer):
-        """
-        Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`.
-        It does ensure `enc(a + b) = enc(a) + enc(a + b)[len(enc(a)):]`.
-        Reference:
-            https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
-        """
-
-        full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
-        prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-
-        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
-        answer_attention_mask = full_tokenized["attention_mask"][len(prompt_input_ids) :]
-
-        # Concat tokens to form `enc(a) + enc(a + b)[len(enc(a)):]`
-        full_concat_input_ids = np.concatenate([prompt_input_ids, answer_input_ids])
-
-        # Prepare input tokens for token by token comparison
-        full_input_ids = np.array(full_tokenized["input_ids"])
-
-        if len(full_input_ids) != len(full_concat_input_ids):
-            raise ValueError("Prompt input ids and answer input ids should have the same length.")
-
-        # On some tokenizers, like Llama-2 tokenizer, there are occasions where tokens
-        # can be merged together when tokenizing prompt+answer. This could result
-        # on the last token from the prompt being different when tokenized on its own
-        # vs when done as prompt+answer.
-        response_token_ids_start_idx = len(prompt_input_ids)
-
-        # If tokenized prompt is different than both prompt+answer, then it means the
-        # last token has changed due to merging.
-        if prompt_input_ids != full_tokenized["input_ids"][:response_token_ids_start_idx]:
-            response_token_ids_start_idx -= 1
-
-        prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
-        prompt_attention_mask = full_tokenized["attention_mask"][:response_token_ids_start_idx]
-
-        if len(prompt_input_ids) != len(prompt_attention_mask):
-            raise ValueError("Prompt input ids and attention mask should have the same length.")
-
-        answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
-        answer_attention_mask = full_tokenized["attention_mask"][response_token_ids_start_idx:]
-
+    def build_tokenized_answer(self, prompt: str, answer: str, answer_dpo_mask: Optional[List[bool]] = None):
+        prompt_tokens = self.tokenizer(prompt)
+        answer_tokens = self.tokenizer(answer)
+        assert answer_dpo_mask is None or len(answer_tokens["input_ids"]) == len(answer_dpo_mask)
+        prompt_loss_codes = np.array([Losses.NONE for _ in range(len(prompt_tokens["input_ids"]))])
+        if answer_dpo_mask:
+            answer_loss_codes = np.array([Losses.DPO if token_mask else Losses.CROSS_ENTROPY for token_mask in answer_dpo_mask])
+        else:
+            answer_loss_codes = np.array([Losses.DPO for _ in range(len(answer_tokens["input_ids"]))])
+            
+        input_ids = np.concatenate([prompt_tokens["input_ids"], answer_tokens["input_ids"][:-1]])
+        target_ids = np.concatenate([prompt_tokens["input_ids"][1:], answer_tokens["input_ids"]])
+        attention_mask = np.concatenate([prompt_tokens["attention_mask"], answer_tokens["attention_mask"][:-1]])
+        loss_codes = np.concatenate([prompt_loss_codes[1:], answer_loss_codes])
+        
         return dict(
-            prompt_input_ids=prompt_input_ids,
-            prompt_attention_mask=prompt_attention_mask,
-            input_ids=answer_input_ids,
-            attention_mask=answer_attention_mask,
+            input_ids=input_ids,
+            target_ids=target_ids,
+            attention_mask=attention_mask,
+            loss_codes=loss_codes,
         )
 
     def tokenize_row(self, feature, model: Optional[Union[PreTrainedModel, nn.Module]] = None) -> Dict:
@@ -728,134 +705,17 @@ class DPOTrainer(Trainer):
         prompt = feature["prompt"]
         chosen = feature["chosen"]
         rejected = feature["rejected"]
-
-        if not self.is_encoder_decoder:
-            # Check issues below for more details
-            #  1. https://github.com/huggingface/trl/issues/907
-            #  2. https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
-            #  3. https://github.com/LianjiaTech/BELLE/issues/337
-
-            if not isinstance(prompt, str):
-                raise ValueError(f"prompt should be an str but got {type(prompt)}")
-            prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)
-            prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
-
-            if not isinstance(chosen, str):
-                raise ValueError(f"chosen should be an str but got {type(chosen)}")
-            chosen_tokens = self.build_tokenized_answer(prompt, chosen)
-
-            if not isinstance(rejected, str):
-                raise ValueError(f"rejected should be an str but got {type(rejected)}")
-            rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-
-            # Last prompt token might get merged by tokenizer and
-            # it should not be included for generation if that happens
-            prompt_len_input_ids = len(prompt_tokens["prompt_input_ids"])
-
-            chosen_prompt_len_input_ids = len(chosen_tokens["prompt_input_ids"])
-            rejected_prompt_len_input_ids = len(rejected_tokens["prompt_input_ids"])
-            prompt_len_input_ids = min(chosen_prompt_len_input_ids, rejected_prompt_len_input_ids)
-
-            for k, v in prompt_tokens.items():
-                prompt_tokens[k] = v[:prompt_len_input_ids]
-
-            # Make sure prompts only have one different token at most an
-            # and length only differs by 1 at most
-            num_diff_tokens = sum(
-                [a != b for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"])]
-            )
-            num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
-            if num_diff_tokens > 1 or num_diff_len > 1:
-                raise ValueError(
-                    "Chosen and rejected prompt_input_ids might only differ on the "
-                    "last token due to tokenizer merge ops."
-                )
-
-            # add BOS token to head of prompt
-            prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
-            chosen_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
-            rejected_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
-
-            prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens["prompt_attention_mask"]
-            chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens["prompt_attention_mask"]
-            rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens["prompt_attention_mask"]
-
-            # add EOS token to end of answer
-            chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-            chosen_tokens["attention_mask"].append(1)
-
-            rejected_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-            rejected_tokens["attention_mask"].append(1)
-
-            longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
-
-            # if combined sequence is too long, truncate the prompt
-            for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-                if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
-                    if self.truncation_mode == "keep_start":
-                        for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                            answer_tokens[k] = answer_tokens[k][: self.max_prompt_length]
-                    elif self.truncation_mode == "keep_end":
-                        for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                            answer_tokens[k] = answer_tokens[k][-self.max_prompt_length :]
-                    else:
-                        raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-
-            # if that's still too long, truncate the response
-            for answer_tokens in [chosen_tokens, rejected_tokens]:
-                if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
-                    for k in ["input_ids", "attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][: self.max_length - self.max_prompt_length]
-
-            # Create labels
-            chosen_sequence_tokens = {
-                k: chosen_tokens[f"prompt_{k}"] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]
-            }
-            rejected_sequence_tokens = {
-                k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
-            }
-            chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-            chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
-                self.label_pad_token_id
-            ] * len(chosen_tokens["prompt_input_ids"])
-            rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-            rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
-                self.label_pad_token_id
-            ] * len(rejected_tokens["prompt_input_ids"])
-
-            for k, toks in {
-                "chosen_": chosen_sequence_tokens,
-                "rejected_": rejected_sequence_tokens,
-                "": prompt_tokens,
-            }.items():
-                for type_key, tokens in toks.items():
-                    if type_key == "token_type_ids":
-                        continue
-                    batch[f"{k}{type_key}"] = tokens
-
-        else:
-            chosen_tokens = self.tokenizer(
-                chosen, truncation=True, max_length=self.max_target_length, add_special_tokens=True
-            )
-            rejected_tokens = self.tokenizer(
-                rejected, truncation=True, max_length=self.max_target_length, add_special_tokens=True
-            )
-            prompt_tokens = self.tokenizer(
-                prompt, truncation=True, max_length=self.max_prompt_length, add_special_tokens=True
-            )
-
-            batch["chosen_labels"] = chosen_tokens["input_ids"]
-            batch["rejected_labels"] = rejected_tokens["input_ids"]
-            batch["prompt_input_ids"] = prompt_tokens["input_ids"]
-            batch["prompt_attention_mask"] = prompt_tokens["attention_mask"]
-
-            if model is not None and hasattr(model, "prepare_decoder_input_ids_from_labels"):
-                batch["rejected_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=torch.tensor(batch["rejected_labels"])
-                )
-                batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=torch.tensor(batch["chosen_labels"])
-                )
+        chosen_dpo_mask = feature["chosen_dpo_mask"] if "chosen_dpo_mask" in feature else None
+        rejected_dpo_mask = feature["rejected_dpo_mask"] if "rejected_dpo_mask" in feature else None
+        weight = feature["weight"] if "weight" in feature else 1.
+        assert weight >= 0
+        
+        for key, value in self.build_tokenized_answer(prompt, chosen, chosen_dpo_mask).items():
+            batch[f"chosen_{key}"] = torch.tensor(value)
+        for key, value in self.build_tokenized_answer(prompt, rejected, rejected_dpo_mask).items():
+            batch[f"rejected_{key}"] = torch.tensor(value)
+            
+        batch["weight"] = torch.tensor(weight)
 
         return batch
 
@@ -882,15 +742,13 @@ class DPOTrainer(Trainer):
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
-                        _,
-                        _,
+                        _, _, _, _, _, _, _,
                     ) = self.concatenated_forward(self.model, padded_batch)
             else:
                 (
                     reference_chosen_logps,
                     reference_rejected_logps,
-                    _,
-                    _,
+                    _, _, _, _, _, _, _,
                 ) = self.concatenated_forward(self.ref_model, padded_batch)
 
         return reference_chosen_logps, reference_rejected_logps
@@ -898,7 +756,6 @@ class DPOTrainer(Trainer):
     @staticmethod
     def concatenated_inputs(
         batch: Dict[str, Union[List, torch.LongTensor]],
-        is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
         padding_value: int = 0,
         device: Optional[torch.device] = None,
@@ -907,7 +764,6 @@ class DPOTrainer(Trainer):
 
         Args:
             batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
             label_pad_token_id: The label pad token id.
             padding_value: The padding value to use for the concatenated inputs_ids.
             device: The device for the concatenated inputs.
@@ -917,44 +773,32 @@ class DPOTrainer(Trainer):
         """
         concatenated_batch = {}
 
-        if is_encoder_decoder:
-            max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
-        else:
-            max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
-
-        for k in batch:
-            if k.startswith("chosen") and isinstance(batch[k], torch.Tensor):
-                if "labels" in k or is_encoder_decoder:
+        max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+        for k in sorted(batch): # so chosen_-prefixed keys will always be first
+            if (k.startswith("chosen_") or k.startswith("rejected_")) and isinstance(batch[k], torch.Tensor):
+                if k.endswith("_ids"):
                     pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
+                elif k.endswith("_mask"):
                     pad_value = 0
-                concatenated_key = k.replace("chosen", "concatenated")
-                concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
-        for k in batch:
-            if k.startswith("rejected") and isinstance(batch[k], torch.Tensor):
-                if "labels" in k or is_encoder_decoder:
-                    pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
-                    pad_value = 0
-                concatenated_key = k.replace("rejected", "concatenated")
-                concatenated_batch[concatenated_key] = torch.cat(
-                    (
-                        concatenated_batch[concatenated_key],
-                        pad_to_length(batch[k], max_length, pad_value=pad_value),
-                    ),
-                    dim=0,
-                ).to(device=device)
+                elif k.endswith("_loss_codes"):
+                    pad_value = Losses.NONE
+                else:
+                    raise ValueError(f"Unexpected key: {k}")
+                concatenated_key = f"concatenated_{'_'.join(k.split('_')[1:])}"
+                padded_value = pad_to_length(batch[k], max_length, pad_value=pad_value)
+                if concatenated_key not in concatenated_batch:
+                    concatenated_batch[concatenated_key] = padded_value
+                else:
+                    concatenated_batch[concatenated_key] = torch.cat(
+                        (
+                            concatenated_batch[concatenated_key],
+                            padded_value,
+                        ),
+                        dim=0,
+                    ).to(device=device)
 
-        if is_encoder_decoder:
-            concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1).to(device=device)
-            concatenated_batch["concatenated_attention_mask"] = (
-                batch["prompt_attention_mask"].repeat(2, 1).to(device=device)
-            )
-
+        concatenated_batch["weight"] = batch["weight"].to(device=device)
+        
         return concatenated_batch
 
     def dpo_loss(
@@ -963,6 +807,13 @@ class DPOTrainer(Trainer):
         policy_rejected_logps: torch.FloatTensor,
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
+        weights: torch.FloatTensor,
+        policy_chosen_logits: torch.FloatTensor,
+        policy_rejected_logits: torch.FloatTensor,
+        chosen_loss_codes: torch.LongTensor,
+        rejected_loss_codes: torch.LongTensor,
+        chosen_target_ids: torch.LongTensor,
+        rejected_target_ids: torch.LongTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -971,10 +822,17 @@ class DPOTrainer(Trainer):
             policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
             reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
             reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
+            weights: Weight to assign to each chosen-rejected pair. Shape: (batch_size,)
+            policy_chosen_logits: Logits of the policy model for the chosen sequences. Shape: (batch_size, sequence_length, vocab_size)
+            policy_rejected_logits: Logits of the policy model for the rejected sequences. Shape: (batch_size, sequence_length, vocab_size)
+            chosen_loss_codes: Loss codes for chosen sequences. Shape: (batch_size, sequence_length)
+            rejected_loss_codes: Loss codes for rejected sequences. Shape: (batch_size, sequence_length)
+            chosen_target_ids: Target ids for chosen sequences. Shape: (batch_size, sequence_length)
+            rejected_target_ids: Target ids for rejected sequences. Shape: (batch_size, sequence_length)
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-            The losses tensor contains the DPO loss for each example in the batch.
+            The losses tensor contains the DPO loss and XEntropy loss for each example in the batch.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
         pi_logratios = policy_chosen_logps - policy_rejected_logps
@@ -1046,41 +904,55 @@ class DPOTrainer(Trainer):
                 - reference_rejected_logps.to(self.accelerator.device)
             ).detach()
         )
-
-        return losses, chosen_rewards, rejected_rewards
+        
+        compute_xentropy = lambda loss_codes, target_ids, logits: (
+            torch.nn.functional.cross_entropy(
+                logits, 
+                target_ids, 
+                reduction='none'
+                ) * (loss_codes == Losses.CROSS_ENTROPY)).mean()
+        
+        xentropy_loss = (
+            compute_xentropy(
+                chosen_loss_codes, 
+                chosen_target_ids, 
+                policy_chosen_logits
+                ) + compute_xentropy(
+                    rejected_loss_codes, 
+                    rejected_target_ids, 
+                    policy_rejected_logits
+                    )
+                ) / 2
+        
+        losses = losses * weights
+        return losses, chosen_rewards, rejected_rewards, xentropy_loss
 
     @staticmethod
     def get_batch_logps(
         logits: torch.FloatTensor,
-        labels: torch.LongTensor,
+        target_ids: torch.LongTensor,
+        loss_codes: torch.LongTensor,
         average_log_prob: bool = False,
-        label_pad_token_id: int = -100,
-        is_encoder_decoder: bool = False,
     ) -> torch.FloatTensor:
         """Compute the log probabilities of the given labels under the given logits.
 
         Args:
             logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
-            labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
+            target_ids: Token ids of the target sequences. Shape: (batch_size, sequence_length)
+            loss_codes: Loss codes for tokens in sequences. Shape: (batch_size, sequence_length)
             average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
-            label_pad_token_id: The label pad token id.
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
 
         Returns:
             A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
         """
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+        if logits.shape[:-1] != loss_codes.shape:
+            raise ValueError(f"First 2 logits dims {logits.shape[:-1]} don't match loss_codes shape {loss_codes.shape}.")
+        if loss_codes.shape != target_ids.shape:
+            raise ValueError(f"Loss codes shape {loss_codes.shape} doesn't match target_ids shape {target_ids.shape}.")
 
-        if not is_encoder_decoder:
-            labels = labels[:, 1:].clone()
-            logits = logits[:, :-1, :]
-        loss_mask = labels != label_pad_token_id
+        loss_mask = loss_codes == Losses.DPO
 
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == label_pad_token_id] = 0
-
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=target_ids.unsqueeze(2)).squeeze(2)
 
         if average_log_prob:
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
@@ -1096,34 +968,23 @@ class DPOTrainer(Trainer):
         """
         concatenated_batch = self.concatenated_inputs(
             batch,
-            is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
             padding_value=self.padding_value,
             device=self.accelerator.device,
         )
-        len_chosen = batch["chosen_labels"].shape[0]
+        len_chosen = batch["chosen_target_ids"].shape[0]
 
-        model_kwargs = (
-            {
-                "labels": concatenated_batch["concatenated_labels"],
-                "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
-            }
-            if self.is_encoder_decoder
-            else {}
-        )
         all_logits = model(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             use_cache=False,
-            **model_kwargs,
         ).logits
 
         all_logps = self.get_batch_logps(
             all_logits,
-            concatenated_batch["concatenated_labels"],
+            concatenated_batch["concatenated_target_ids"],
+            concatenated_batch["concatenated_loss_codes"],
             average_log_prob=self.loss_type == "ipo",
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
         )
 
         chosen_logps = all_logps[:len_chosen]
@@ -1131,8 +992,14 @@ class DPOTrainer(Trainer):
 
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
+        
+        chosen_loss_codes = concatenated_batch["concatenated_loss_codes"][:len_chosen]
+        rejected_loss_codes = concatenated_batch["concatenated_loss_codes"][len_chosen:]
+        
+        chosen_target_ids = concatenated_batch["concatenated_target_ids"][:len_chosen]
+        rejected_target_ids = concatenated_batch["concatenated_target_ids"][len_chosen:]
 
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits)
+        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_loss_codes, rejected_loss_codes, chosen_target_ids, rejected_target_ids, concatenated_batch["weights"])
 
     def get_batch_loss_metrics(
         self,
@@ -1148,8 +1015,13 @@ class DPOTrainer(Trainer):
             policy_rejected_logps,
             policy_chosen_logits,
             policy_rejected_logits,
+            chosen_loss_codes,
+            rejected_loss_codes,
+            chosen_target_ids,
+            rejected_target_ids,
+            weights,
         ) = self.concatenated_forward(model, batch)
-
+        
         # if reference_chosen_logps and reference_rejected_logps in batch use them, otherwise use the reference model
         if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
             reference_chosen_logps = batch["reference_chosen_logps"]
@@ -1161,22 +1033,27 @@ class DPOTrainer(Trainer):
                         (
                             reference_chosen_logps,
                             reference_rejected_logps,
-                            _,
-                            _,
+                            _, _, _, _, _, _, _,
                         ) = self.concatenated_forward(self.model, batch)
                 else:
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
-                        _,
-                        _,
+                        _, _, _, _, _, _, _,
                     ) = self.concatenated_forward(self.ref_model, batch)
-
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+        
+        losses, chosen_rewards, rejected_rewards, xentropy_loss = self.dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
+            weights,
+            policy_chosen_logits,
+            policy_rejected_logits,
+            chosen_loss_codes,
+            rejected_loss_codes,
+            chosen_target_ids,
+            rejected_target_ids,
         )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -1189,8 +1066,9 @@ class DPOTrainer(Trainer):
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+        metrics[f"{prefix}xentropy"] = xentropy_loss.detach().cpu()
 
-        return losses.mean(), metrics
+        return losses.mean(), xentropy_loss, metrics
 
     def compute_loss(
         self,
@@ -1207,62 +1085,17 @@ class DPOTrainer(Trainer):
         compute_loss_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
 
         with compute_loss_context_manager():
-            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
+            loss, xentropy_loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
         # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
         loss = loss.to(self.args.device)
+        xentropy_loss = xentropy_loss.to(self.args.device)
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
 
         if return_outputs:
-            return (loss, metrics)
-        return loss
-
-    def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
-        """Generate samples from the model and reference model for the given batch of inputs."""
-
-        # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
-        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
-        generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
-
-        with generate_context_manager():
-            policy_output = model.generate(
-                input_ids=batch["prompt_input_ids"],
-                attention_mask=batch["prompt_attention_mask"],
-                max_length=self.max_length,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-            # if reference_output in batch use that otherwise use the reference model
-            if "reference_output" in batch:
-                reference_output = batch["reference_output"]
-            else:
-                if self.ref_model is None:
-                    with self.null_ref_context():
-                        reference_output = self.model.generate(
-                            input_ids=batch["prompt_input_ids"],
-                            attention_mask=batch["prompt_attention_mask"],
-                            max_length=self.max_length,
-                            do_sample=True,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                        )
-                else:
-                    reference_output = self.ref_model.generate(
-                        input_ids=batch["prompt_input_ids"],
-                        attention_mask=batch["prompt_attention_mask"],
-                        max_length=self.max_length,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                    )
-
-        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
-        policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
-
-        reference_output = pad_to_length(reference_output, self.max_length, self.tokenizer.pad_token_id)
-        reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
-
-        return policy_output_decoded, reference_output_decoded
+            return (loss + xentropy_loss, metrics)
+        return loss + xentropy_loss
 
     def prediction_step(
         self,
@@ -1285,7 +1118,7 @@ class DPOTrainer(Trainer):
         prediction_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
 
         with torch.no_grad(), prediction_context_manager():
-            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
+            loss, xentropy_loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
 
         # force log the metrics
         self.store_metrics(metrics, train_eval="eval")
@@ -1322,34 +1155,6 @@ class DPOTrainer(Trainer):
 
         Works both with or without labels.
         """
-
-        # Sample and save to game log if requested (for one batch to save time)
-        if self.generate_during_eval:
-            # Generate random indices within the range of the total number of samples
-            num_samples = len(dataloader.dataset)
-            random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
-
-            # Use dataloader.dataset.select to get the random batch without iterating over the DataLoader
-            random_batch_dataset = dataloader.dataset.select(random_indices)
-            random_batch = self.data_collator(random_batch_dataset)
-            random_batch = self._prepare_inputs(random_batch)
-
-            policy_output_decoded, ref_output_decoded = self.get_batch_samples(self.model, random_batch)
-
-            self.log(
-                {
-                    "game_log": wandb.Table(
-                        columns=["Prompt", "Policy", "Ref Model"],
-                        rows=[
-                            [prompt, pol[len(prompt) :], ref[len(prompt) :]]
-                            for prompt, pol, ref in zip(
-                                random_batch["prompt"], policy_output_decoded, ref_output_decoded
-                            )
-                        ],
-                    )
-                }
-            )
-            self.state.log_history.pop()
 
         # Base evaluation
         initial_output = super().evaluation_loop(
