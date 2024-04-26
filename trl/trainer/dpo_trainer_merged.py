@@ -744,11 +744,19 @@ class DPOTrainer(Trainer):
                         reference_rejected_logps,
                         _,
                         _,
+                        _,
+                        _,
+                        _,
+                        _,
                     ) = self.concatenated_forward(self.model, padded_batch)
             else:
                 (
                     reference_chosen_logps,
                     reference_rejected_logps,
+                    _,
+                    _,
+                    _,
+                    _,
                     _,
                     _,
                 ) = self.concatenated_forward(self.ref_model, padded_batch)
@@ -989,8 +997,12 @@ class DPOTrainer(Trainer):
             policy_rejected_logps,
             policy_chosen_logits,
             policy_rejected_logits,
+            chosen_loss_codes,
+            rejected_loss_codes,
+            chosen_target_ids,
+            rejected_target_ids,
         ) = self.concatenated_forward(model, batch)
-
+        
         # if reference_chosen_logps and reference_rejected_logps in batch use them, otherwise use the reference model
         if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
             reference_chosen_logps = batch["reference_chosen_logps"]
@@ -1004,11 +1016,19 @@ class DPOTrainer(Trainer):
                             reference_rejected_logps,
                             _,
                             _,
+                            _,
+                            _,
+                            _,
+                            _,
                         ) = self.concatenated_forward(self.model, batch)
                 else:
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
+                        _,
+                        _,
+                        _,
+                        _,
                         _,
                         _,
                     ) = self.concatenated_forward(self.ref_model, batch)
@@ -1018,6 +1038,10 @@ class DPOTrainer(Trainer):
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
+            chosen_loss_codes,
+            rejected_loss_codes,
+            chosen_target_ids,
+            rejected_target_ids,
         )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
