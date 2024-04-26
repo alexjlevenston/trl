@@ -777,44 +777,32 @@ class DPOTrainer(Trainer):
         """
         concatenated_batch = {}
 
-        if is_encoder_decoder:
-            max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
-        else:
-            max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
-
-        for k in batch:
-            if k.startswith("chosen") and isinstance(batch[k], torch.Tensor):
-                if "labels" in k or is_encoder_decoder:
+        max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+        for k in sorted(batch): # so chosen_-prefixed keys will always be first
+            if (k.startswith("chosen_") or k.startswith("rejected_")) and isinstance(batch[k], torch.Tensor):
+                if k.endswith("_ids"):
                     pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
+                elif k.endswith("_mask"):
                     pad_value = 0
-                concatenated_key = k.replace("chosen", "concatenated")
-                concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
-        for k in batch:
-            if k.startswith("rejected") and isinstance(batch[k], torch.Tensor):
-                if "labels" in k or is_encoder_decoder:
-                    pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
-                    pad_value = 0
-                concatenated_key = k.replace("rejected", "concatenated")
-                concatenated_batch[concatenated_key] = torch.cat(
-                    (
-                        concatenated_batch[concatenated_key],
-                        pad_to_length(batch[k], max_length, pad_value=pad_value),
-                    ),
-                    dim=0,
-                ).to(device=device)
+                elif k.endswith("_loss_codes"):
+                    pad_value = Losses.NONE
+                else:
+                    raise ValueError(f"Unexpected key: {k}")
+                concatenated_key = f"concatenated_{'_'.join(k.split('_')[1:])}"
+                padded_value = pad_to_length(batch[k], max_length, pad_value=pad_value)
+                if concatenated_key not in concatenated_batch:
+                    concatenated_batch[concatenated_key] = padded_value
+                else:
+                    concatenated_batch[concatenated_key] = torch.cat(
+                        (
+                            concatenated_batch[concatenated_key],
+                            padded_value,
+                        ),
+                        dim=0,
+                    ).to(device=device)
 
-        if is_encoder_decoder:
-            concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1).to(device=device)
-            concatenated_batch["concatenated_attention_mask"] = (
-                batch["prompt_attention_mask"].repeat(2, 1).to(device=device)
-            )
-
+        concatenated_batch["weight"] = batch["weight"].to(device=device)
+        
         return concatenated_batch
 
     def dpo_loss(
