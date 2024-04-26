@@ -945,13 +945,12 @@ class DPOTrainer(Trainer):
             padding_value=self.padding_value,
             device=self.accelerator.device,
         )
-        len_chosen = batch["chosen_labels"].shape[0]
+        len_chosen = batch["chosen_target_ids"].shape[0]
 
         all_logits = model(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             use_cache=False,
-            **model_kwargs,
         ).logits
 
         all_logps = self.get_batch_logps(
