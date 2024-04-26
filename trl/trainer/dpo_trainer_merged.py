@@ -819,6 +819,7 @@ class DPOTrainer(Trainer):
         policy_rejected_logps: torch.FloatTensor,
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
+        weights: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -827,6 +828,7 @@ class DPOTrainer(Trainer):
             policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
             reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
             reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
+            weights: Weight to assign to each chosen-rejected pair. Shape: (batch_size,)
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
@@ -902,6 +904,8 @@ class DPOTrainer(Trainer):
                 - reference_rejected_logps.to(self.accelerator.device)
             ).detach()
         )
+        
+        losses = losses * weights
 
         return losses, chosen_rewards, rejected_rewards
 
@@ -981,7 +985,7 @@ class DPOTrainer(Trainer):
         chosen_target_ids = concatenated_batch["concatenated_target_ids"][:len_chosen]
         rejected_target_ids = concatenated_batch["concatenated_target_ids"][len_chosen:]
 
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_loss_codes, rejected_loss_codes, chosen_target_ids, rejected_target_ids)
+        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_loss_codes, rejected_loss_codes, chosen_target_ids, rejected_target_ids, concatenated_batch["weights"])
 
     def get_batch_loss_metrics(
         self,
@@ -1001,6 +1005,7 @@ class DPOTrainer(Trainer):
             rejected_loss_codes,
             chosen_target_ids,
             rejected_target_ids,
+            weights,
         ) = self.concatenated_forward(model, batch)
         
         # if reference_chosen_logps and reference_rejected_logps in batch use them, otherwise use the reference model
@@ -1038,10 +1043,7 @@ class DPOTrainer(Trainer):
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
-            chosen_loss_codes,
-            rejected_loss_codes,
-            chosen_target_ids,
-            rejected_target_ids,
+            weights,
         )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
