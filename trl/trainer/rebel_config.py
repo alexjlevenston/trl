@@ -37,6 +37,8 @@ class REBELConfig(TrainingArguments):
             Name of the reference PEFT adapter, when using LoRA with multiple adapters.
         force_use_ref_model (`bool`, defaults to `False`):
             In case one passes a PEFT model for the active model and you want to use a different model for the ref_model, set this flag to `True`.
+        eta (`float`, defaults to `1.0`):
+            The implicit rewards computed in the REBEL objective function are multiplied by the inverse of this parameter.
     """
 
     pad_token_id: int
@@ -47,3 +49,4 @@ class REBELConfig(TrainingArguments):
     model_adapter_name: Optional[str] = None
     ref_adapter_name: Optional[str] = None
     force_use_ref_model: bool = False
+    eta: float = 1.0
