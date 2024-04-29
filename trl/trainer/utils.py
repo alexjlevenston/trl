@@ -380,7 +380,7 @@ class REBELDataCollatorWithPadding:
         # first, pad everything to the same length
         padded_batch = {}
         for k in features[0].keys():
-            if k.endswith("player_token_ids"):
+            if k.endswith("player_ids"):
                 pad_value = -1
             elif k.endswith("ids"):
                 pad_value = self.pad_token_id
