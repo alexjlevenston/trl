@@ -32,6 +32,7 @@ from transformers.trainer_utils import has_length
 
 from ..import_utils import is_peft_available, is_unsloth_available, is_xpu_available
 from ..trainer.model_config import ModelConfig
+from .loss_type import LossType
 
 
 if is_peft_available():
@@ -361,6 +362,39 @@ class DPODataCollatorWithPadding:
             else:
                 padded_batch[k] = [ex[k] for ex in features]
 
+        return padded_batch
+
+
+@dataclass
+class REBELDataCollatorWithPadding:
+    r"""
+    REBEL DataCollator class that pads the tokenized inputs to the maximum length of the batch.
+    Args:
+        pad_token_id (`int`):
+            The tokenizer's pad_token_id.
+    """
+
+    pad_token_id: int
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # first, pad everything to the same length
+        padded_batch = {}
+        for k in features[0].keys():
+            if k.endswith("player_token_ids"):
+                pad_value = -1
+            elif k.endswith("ids"):
+                pad_value = self.pad_token_id
+            elif k.endswith("mask"):
+                pad_value = 0
+            elif k.endswith("rewards"):
+                pad_value = 0
+            elif k.endswith("loss_codes"):
+                pad_value = LossType.NONE
+            else:
+                raise ValueError(f"Unexpected key encountered in data collator: {k}")
+            to_pad = [torch.LongTensor(row[k]) for row in features]
+            padded_column = pad_sequence(to_pad, batch_first=True, padding_value=pad_value)
+            padded_batch[k] = padded_column
         return padded_batch
 
 
