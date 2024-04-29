@@ -108,6 +108,7 @@ class REBELTrainer(Trainer):
             "model_adapter_name",
             "ref_adapter_name",
             "force_use_ref_model",
+            "eta",
         ],
         custom_message="Deprecated positional argument(s) used in REBELTrainer, please use the REBELConfig to set these arguments instead.",
     )
@@ -132,6 +133,7 @@ class REBELTrainer(Trainer):
         model_adapter_name: Optional[str] = None,
         ref_adapter_name: Optional[str] = None,
         force_use_ref_model: bool = False,
+        eta: Optional[float] = None,
     ):
         if model_init_kwargs is not None:
             warnings.warn(
@@ -328,6 +330,14 @@ class REBELTrainer(Trainer):
             )
             args.dataset_num_proc = dataset_num_proc
         self.dataset_num_proc = args.dataset_num_proc
+        
+        if eta is not None:
+            warnings.warn(
+                "You passed `eta` to the REBELTrainer, the value you passed will override the one in the `REBELConfig`."
+            )
+            self.eta = eta
+        else:
+            self.eta = args.eta
 
         # Compute that only on the main process for faster data processing.
         # see: https://github.com/huggingface/trl/pull/1255
@@ -503,30 +513,6 @@ class REBELTrainer(Trainer):
             if self.ref_adapter_name:
                 self.model.set_adapter(self.model_adapter_name or "default")
 
-    def compute_reference_log_probs(self, padded_batch: Dict) -> Dict:
-        """Computes log probabilities of the reference model for a single padded batch of a REBEL specific dataset."""
-        compte_ref_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
-
-        # compute reference logps
-        with torch.no_grad(), compte_ref_context_manager():
-            if self.ref_model is None:
-                with self.null_ref_context():
-                    (
-                        reference_chosen_logps,
-                        reference_rejected_logps,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self.model, padded_batch)
-            else:
-                (
-                    reference_chosen_logps,
-                    reference_rejected_logps,
-                    _,
-                    _,
-                ) = self.concatenated_forward(self.ref_model, padded_batch)
-
-        return reference_chosen_logps, reference_rejected_logps
-
     @staticmethod
     def concatenated_inputs(
         batch: Dict[str, Union[torch.LongTensor]],
@@ -574,180 +560,78 @@ class REBELTrainer(Trainer):
 
     def rebel_loss(
         self,
-        policy_chosen_logps: torch.FloatTensor,
-        policy_rejected_logps: torch.FloatTensor,
-        reference_chosen_logps: torch.FloatTensor,
-        reference_rejected_logps: torch.FloatTensor,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        policy_logits: torch.FloatTensor,
+        reference_logits: torch.FloatTensor,
+        concatenated_batch: Dict[str, Union[torch.LongTensor]],
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the REBEL loss for a batch of policy and reference model log probabilities.
 
         Args:
-            policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-            policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-            reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-            reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
+            policy_logits: pre-softmax policy model outputs
+            reference_logits: pre-softmax reference model outputs
+            concatenated_batch: the concatenated batch tensors
 
         Returns:
-            A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-            The losses tensor contains the REBEL loss for each example in the batch.
+            A tuple of four tensors: (xentropy, rebel, chosen_rewards, rejected_rewards).
+            The xentropy tensor contains the xentropy loss.
+            The rebel tensor contains the rebel loss.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
-        pi_logratios = policy_chosen_logps - policy_rejected_logps
-        if self.reference_free:
-            ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
-        else:
-            ref_logratios = reference_chosen_logps - reference_rejected_logps
-
-        pi_logratios = pi_logratios.to(self.accelerator.device)
-        ref_logratios = ref_logratios.to(self.accelerator.device)
-        logits = pi_logratios - ref_logratios
-
-        # The beta is a temperature parameter for the REBEL loss, typically something in the range of 0.1 to 0.5.
-        # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the labels and
-        # calculates a conservative REBEL loss.
-        if self.loss_type == "sigmoid":
-            losses = (
-                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
-            )
-        elif self.loss_type == "hinge":
-            losses = torch.relu(1 - self.beta * logits)
-        elif self.loss_type == "ipo":
-            # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
-            losses = (logits - 1 / (2 * self.beta)) ** 2
-        elif self.loss_type == "kto_pair":
-            # eqn (7) of the HALOs paper
-            chosen_KL = (policy_chosen_logps - reference_chosen_logps).mean().clamp(min=0)
-            rejected_KL = (policy_rejected_logps - reference_rejected_logps).mean().clamp(min=0)
-
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            # As described in the KTO report, the KL term for chosen (rejected) is estimated using the rejected (chosen) half.
-            losses = torch.cat(
-                (
-                    1 - F.sigmoid(self.beta * (chosen_logratios - rejected_KL)),
-                    1 - F.sigmoid(self.beta * (chosen_KL - rejected_logratios)),
-                ),
-                0,
-            )
-        elif self.loss_type == "bco_pair":
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-
-            chosen_rewards = self.beta * chosen_logratios
-            rejected_rewards = self.beta * rejected_logratios
-            rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
-            self.running.update(rewards)
-            delta = self.running.mean
-
-            losses = -F.logsigmoid((self.beta * chosen_logratios) - delta) - F.logsigmoid(
-                -(self.beta * rejected_logratios - delta)
-            )
-        else:
-            raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair', 'bco_pair']"
-            )
-
-        chosen_rewards = (
-            self.beta
-            * (
-                policy_chosen_logps.to(self.accelerator.device) - reference_chosen_logps.to(self.accelerator.device)
-            ).detach()
+        assert policy_logits.shape[0] % 2 == 0
+        
+        split = lambda tensor: (tensor[:tensor.shape[0] // 2], tensor[tensor.shape[0] // 2:])
+        policy_chosen_logits, policy_rejected_logits = split(policy_logits)
+        reference_chosen_logits, reference_rejected_logits = split(reference_logits)
+        chosen_target_ids, rejected_target_ids = split(concatenated_batch["concatenated_target_ids"])
+        chosen_loss_codes, rejected_loss_codes = split(concatenated_batch["concatenated_loss_codes"])
+        chosen_player_ids, rejected_player_ids = split(concatenated_batch["concatenated_player_ids"])
+        chosen_rewards, rejected_rewards = split(concatenated_batch["concatenated_rewards"])
+        
+        compute_xentropy = lambda logits, targets, loss_codes: (F.cross_entropy(logits, targets, reduction='none') * (loss_codes == LossType.XENTROPY)).mean()
+        xentropy = 0.5 * (
+            compute_xentropy(policy_chosen_logits, chosen_target_ids, chosen_loss_codes) + \
+            compute_xentropy(policy_rejected_logits, rejected_target_ids, rejected_loss_codes)
         )
-        rejected_rewards = (
-            self.beta
-            * (
-                policy_rejected_logps.to(self.accelerator.device)
-                - reference_rejected_logps.to(self.accelerator.device)
-            ).detach()
-        )
-
-        return losses, chosen_rewards, rejected_rewards
-
-    @staticmethod
-    def get_batch_logps(
-        logits: torch.FloatTensor,
-        labels: torch.LongTensor,
-        average_log_prob: bool = False,
-        label_pad_token_id: int = -100,
-        is_encoder_decoder: bool = False,
-    ) -> torch.FloatTensor:
-        """Compute the log probabilities of the given labels under the given logits.
-
-        Args:
-            logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
-            labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
-            average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
-            label_pad_token_id: The label pad token id.
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
-
-        Returns:
-            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
-        """
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
-
-        if not is_encoder_decoder:
-            labels = labels[:, 1:].clone()
-            logits = logits[:, :-1, :]
-        loss_mask = labels != label_pad_token_id
-
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == label_pad_token_id] = 0
-
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-
-        if average_log_prob:
-            return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-        else:
-            return (per_token_logps * loss_mask).sum(-1)
+        
+        rebel = torch.zeros_like(xentropy)
+        policy_chosen_logits = torch.gather(F.log_softmax(policy_chosen_logits), dim=2, index=chosen_target_ids[..., None])
+        policy_rejected_logits = torch.gather(F.log_softmax(policy_rejected_logits), dim=2, index=rejected_target_ids[..., None])
+        reference_chosen_logits = torch.gather(F.log_softmax(reference_chosen_logits), dim=2, index=chosen_target_ids[..., None])
+        reference_rejected_logits = torch.gather(F.log_softmax(reference_rejected_logits), dim=2, index=rejected_target_ids[..., None])
+        
+        impl_chosen_rewards = []
+        impl_rejected_rewards = []
+        player_ids = [player_id for player_id in list(chosen_player_ids.unique()) if i > -1] # chosen_player_ids.unique() is guaranteed to equal rejected_player_ids.unique()
+        for player_id in player_ids:
+            chosen_mask = chosen_player_ids == player_id
+            rejected_mask = rejected_player_ids == player_id
+            impl_chosen_reward = 1. / self.eta * ((policy_chosen_logits * chosen_mask).sum(-1) - (reference_chosen_logits * chosen_mask).sum(-1))
+            impl_rejected_reward = 1. / self.eta * ((policy_rejected_logits * rejected_mask).sum(-1) - (reference_rejected_logits * rejected_mask).sum(-1))
+            impl_regret = impl_chosen_reward - impl_rejected_reward
+            actual_regret = chosen_rewards[:, player_id] - rejected_rewards[:, player_id]
+            rebel = rebel + (actual_regret - impl_regret).pow(2).mean() / len(player_ids)
+            impl_chosen_rewards.append(impl_chosen_reward.detach())
+            impl_rejected_rewards.append(impl_rejected_reward.detach())
+        
+        impl_chosen_rewards = torch.cat(impl_chosen_rewards, dim=0)
+        impl_rejected_rewards = torch.cat(impl_rejected_rewards, dim=0)
+        return xentropy, rebel, impl_chosen_rewards, impl_rejected_rewards
 
     def concatenated_forward(
-        self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        self, model: nn.Module, concatenated_batch: Dict[str, Union[List, torch.LongTensor]]
+    ) -> torch.FloatTensor:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
-        concatenated_batch = self.concatenated_inputs(
-            batch,
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
-            padding_value=self.padding_value,
-            device=self.accelerator.device,
-        )
-        len_chosen = batch["chosen_labels"].shape[0]
-
-        model_kwargs = (
-            {
-                "labels": concatenated_batch["concatenated_labels"],
-                "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
-            }
-            if self.is_encoder_decoder
-            else {}
-        )
+        
         all_logits = model(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             use_cache=False,
-            **model_kwargs,
         ).logits
-
-        all_logps = self.get_batch_logps(
-            all_logits,
-            concatenated_batch["concatenated_labels"],
-            average_log_prob=self.loss_type == "ipo",
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
-        )
-
-        chosen_logps = all_logps[:len_chosen]
-        rejected_logps = all_logps[len_chosen:]
-
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
-
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits)
+        
+        return all_logits
 
     def get_batch_loss_metrics(
         self,
@@ -757,41 +641,24 @@ class REBELTrainer(Trainer):
     ):
         """Compute the REBEL loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
+        
+        concatenated_batch = self.concatenated_inputs(
+            batch,
+            device=self.accelerator.device,
+        )
 
-        (
-            policy_chosen_logps,
-            policy_rejected_logps,
-            policy_chosen_logits,
-            policy_rejected_logits,
-        ) = self.concatenated_forward(model, batch)
+        policy_logits = self.concatenated_forward(model, concatenated_batch)
 
-        # if reference_chosen_logps and reference_rejected_logps in batch use them, otherwise use the reference model
-        if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
-            reference_chosen_logps = batch["reference_chosen_logps"]
-            reference_rejected_logps = batch["reference_rejected_logps"]
-        else:
-            with torch.no_grad():
-                if self.ref_model is None:
-                    with self.null_ref_context():
-                        (
-                            reference_chosen_logps,
-                            reference_rejected_logps,
-                            _,
-                            _,
-                        ) = self.concatenated_forward(self.model, batch)
-                else:
-                    (
-                        reference_chosen_logps,
-                        reference_rejected_logps,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self.ref_model, batch)
 
-        losses, chosen_rewards, rejected_rewards = self.rebel_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            reference_chosen_logps,
-            reference_rejected_logps,
+        with torch.no_grad():
+            if self.ref_model is None:
+                with self.null_ref_context():
+                    reference_logits = self.concatenated_forward(self.model, concatenated_batch)
+            else:
+                reference_logits = self.concatenated_forward(self.ref_model, concatenated_batch)
+
+        xentropy, rebel, chosen_rewards, rejected_rewards = self.rebel_loss(
+            policy_logits, reference_logits, concatenated_batch,
         )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -805,7 +672,7 @@ class REBELTrainer(Trainer):
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
 
-        return losses.mean(), metrics
+        return rebel + xentropy, metrics
 
     def compute_loss(
         self,
