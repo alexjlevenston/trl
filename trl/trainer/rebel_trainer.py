@@ -348,7 +348,6 @@ class REBELTrainer(Trainer):
             compute_metrics=compute_metrics,
             callbacks=callbacks,
             optimizers=optimizers,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
 
         # Add tags for models that have been loaded with the correct transformers version
