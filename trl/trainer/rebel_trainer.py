@@ -598,20 +598,23 @@ class REBELTrainer(Trainer):
         policy_rejected_logits = torch.gather(F.log_softmax(policy_rejected_logits), dim=2, index=rejected_target_ids[..., None])
         reference_chosen_logits = torch.gather(F.log_softmax(reference_chosen_logits), dim=2, index=chosen_target_ids[..., None])
         reference_rejected_logits = torch.gather(F.log_softmax(reference_rejected_logits), dim=2, index=rejected_target_ids[..., None])
+        chosen_diff = policy_chosen_logits - reference_chosen_logits
+        rejected_diff = policy_rejected_logits - reference_rejected_logits
         
         impl_chosen_rewards = []
         impl_rejected_rewards = []
-        player_ids = [player_id for player_id in list(chosen_player_ids.unique()) if i > -1] # chosen_player_ids.unique() is guaranteed to equal rejected_player_ids.unique()
+        player_ids = [player_id for player_id in list(chosen_player_ids.unique()) if player_id > -1] # chosen_player_ids.unique() is guaranteed to equal rejected_player_ids.unique()
         for player_id in player_ids:
             chosen_mask = chosen_player_ids == player_id
             rejected_mask = rejected_player_ids == player_id
-            impl_chosen_reward = 1. / self.eta * ((policy_chosen_logits * chosen_mask).sum(-1) - (reference_chosen_logits * chosen_mask).sum(-1))
-            impl_rejected_reward = 1. / self.eta * ((policy_rejected_logits * rejected_mask).sum(-1) - (reference_rejected_logits * rejected_mask).sum(-1))
+            impl_chosen_reward = 1. / self.eta * (chosen_diff * (chosen_player_ids == player_id)).sum(-1)
+            impl_rejected_reward = 1. / self.eta * (rejected_diff * (rejected_player_ids == player_id)).sum(-1)
             impl_regret = impl_chosen_reward - impl_rejected_reward
             actual_regret = chosen_rewards[:, player_id] - rejected_rewards[:, player_id]
-            rebel = rebel + (actual_regret - impl_regret).pow(2).mean() / len(player_ids)
+            rebel = rebel + (actual_regret - impl_regret).pow(2).mean()
             impl_chosen_rewards.append(impl_chosen_reward.detach())
             impl_rejected_rewards.append(impl_rejected_reward.detach())
+        rebel = rebel / len(player_ids)
         
         impl_chosen_rewards = torch.cat(impl_chosen_rewards, dim=0)
         impl_rejected_rewards = torch.cat(impl_rejected_rewards, dim=0)
